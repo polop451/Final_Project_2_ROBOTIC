@@ -1,0 +1,23 @@
+from robodk.robolink import *
+import json
+
+# --- ตั้งค่า RoboDK ---
+RDK = Robolink()
+robot1 = RDK.Item('Dobot1', ITEM_TYPE_ROBOT) #dobot mg400
+robot2 = RDK.Item('Dobot2', ITEM_TYPE_ROBOT) #dobot mg400
+
+def test():
+    # ตัวอย่างข้อมูลที่ส่งมา
+    data1 = [-85.303622, 57.667159, 48.795908, 123.896379,0,0]  # ตัวอย่างตำแหน่งสำหรับ Dobot1
+    data2 = [-85.303622, 57.667159, 48.795908, 123.896379,0,0]  # ตัวอย่างตำแหน่งสำหรับ Dobot2
+
+    print(f"🤖 Dobot1 Move to: {data1}")
+    if robot1.Valid():
+        robot1.MoveJ(data1, blocking=False)
+
+    print(f"🤖 Dobot2 Move to: {data2}")
+    if robot2.Valid():
+        robot2.MoveJ(data2, blocking=False)
+
+if __name__ == "__main__":
+    test()
