@@ -1,0 +1,7 @@
+timestamp,source,event_type,robot,action,result,x,y,z,r,j1,j2,j3,j4,note
+2026-05-04 19:33:30.041,SENT,COMMAND,R1,process,good,,,,,,,,,
+2026-05-04 19:33:30.804,SENT,COMMAND,R1,process,good,,,,,,,,,
+2026-05-04 19:33:31.149,SENT,COMMAND,R1,process,good,,,,,,,,,
+2026-05-04 19:33:31.345,SENT,COMMAND,R1,process,good,,,,,,,,,
+2026-05-04 19:33:31.533,SENT,COMMAND,R1,process,good,,,,,,,,,
+2026-05-04 19:33:31.712,SENT,COMMAND,R1,process,good,,,,,,,,,

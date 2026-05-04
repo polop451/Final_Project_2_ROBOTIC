@@ -13,10 +13,13 @@ Topics subscribe (feedback):
   factory/system/status
 """
 
+import csv
 import json
+import os
 import queue
 import threading
 import time
+from collections import deque
 from datetime import datetime
 
 import customtkinter as ctk
@@ -57,6 +60,43 @@ C_RAIL_ON   = "#27ae60"
 C_RAIL_OFF  = "#2c3e50"
 
 # =============================================================================
+# --- CSV LOGGER ---
+# =============================================================================
+class _CsvLogger:
+    """Thread-safe CSV event logger. Creates a new timestamped file each run."""
+
+    FIELDS = [
+        "timestamp", "source", "event_type", "robot",
+        "action", "result", "x", "y", "z", "r",
+        "j1", "j2", "j3", "j4", "note",
+    ]
+
+    def __init__(self):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            f"robot_log_{ts}.csv",
+        )
+        self._lock = threading.Lock()
+        with open(self._path, "w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=self.FIELDS).writeheader()
+
+    @property
+    def path(self) -> str:
+        return self._path
+
+    def log(self, **kwargs):
+        """Write one event row. Unknown keys are silently ignored."""
+        row = {f: "" for f in self.FIELDS}
+        row["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        for k, v in kwargs.items():
+            if k in row:
+                row[k] = v
+        with self._lock:
+            with open(self._path, "a", newline="", encoding="utf-8") as f:
+                csv.DictWriter(f, fieldnames=self.FIELDS).writerow(row)
+
+# =============================================================================
 # --- MAIN WINDOW ---
 # =============================================================================
 ctk.set_appearance_mode("dark")
@@ -85,6 +125,15 @@ class SimPublisherGUI(ctk.CTk):
         self._2dof_angle = 0.0
         self._2dof_state = "idle"
         self._test_running = False
+        # CSV logging state tracking
+        self._last_r1_ir     = -1
+        self._last_r2_ir     = -1
+        self._last_sys_status = ""
+        self._last_2dof_state = ""
+        self._last_r1j: list = [None, None, None, None]
+        self._last_r2j: list = [None, None, None, None]
+        self._sent_msgs: deque = deque(maxlen=30)
+        self._csv = _CsvLogger()
 
         self._build_ui()
         self._mqtt_connect()
@@ -390,6 +439,18 @@ class SimPublisherGUI(ctk.CTk):
                       fg_color=C_ACCENT, hover_color="#1a5276",
                       font=ctk.CTkFont(size=11),
                       command=self._clear_log).pack(side="right")
+        ctk.CTkButton(
+            hdr, text="📂", width=30, height=24,
+            fg_color=C_ACCENT, hover_color="#1a5276",
+            font=ctk.CTkFont(size=11),
+            command=lambda: os.system(f'open "{os.path.dirname(self._csv.path)}"'),
+        ).pack(side="right", padx=(0, 2))
+        ctk.CTkLabel(
+            hdr,
+            text=f"📊 {os.path.basename(self._csv.path)}",
+            font=ctk.CTkFont(family="Menlo", size=10),
+            text_color=C_MUTED,
+        ).pack(side="left", padx=(8, 0))
 
         self._log_box = ctk.CTkTextbox(
             card, fg_color="#0d1117", text_color=C_TEXT,
@@ -633,6 +694,9 @@ class SimPublisherGUI(ctk.CTk):
             client.subscribe(SUB_R2_IR)
             client.subscribe(SUB_SYS_STATUS)
             client.subscribe(SUB_2DOF_JOINTS)
+            client.subscribe(TOPIC_R1)    # capture external commands for CSV log
+            client.subscribe(TOPIC_R2)
+            client.subscribe(TOPIC_BOTH)
             self._msg_q.put(("connected", True))
             self._msg_q.put(("log", f"Connected to {MQTT_BROKER}", C_GOOD))
         else:
@@ -644,23 +708,99 @@ class SimPublisherGUI(ctk.CTk):
 
     def _on_message(self, client, userdata, msg):
         try:
-            data  = json.loads(msg.payload.decode())
+            raw   = msg.payload.decode()
+            data  = json.loads(raw)
             topic = msg.topic
 
             if topic == SUB_R1_JOINTS:
-                self._msg_q.put(("r1_joints", [data["j1"], data["j2"],
-                                               data["j3"], data["j4"]]))
+                joints = [data["j1"], data["j2"], data["j3"], data["j4"]]
+                self._msg_q.put(("r1_joints", joints))
+                last = self._last_r1j
+                if last[0] is None or any(abs(joints[i] - last[i]) > 5.0 for i in range(4)):
+                    self._last_r1j = joints[:]
+                    self._csv.log(
+                        source="RECV", event_type="JOINTS", robot="R1",
+                        j1=round(joints[0], 2), j2=round(joints[1], 2),
+                        j3=round(joints[2], 2), j4=round(joints[3], 2),
+                    )
+
             elif topic == SUB_R2_JOINTS:
-                self._msg_q.put(("r2_joints", [data["j1"], data["j2"],
-                                               data["j3"], data["j4"]]))
+                joints = [data["j1"], data["j2"], data["j3"], data["j4"]]
+                self._msg_q.put(("r2_joints", joints))
+                last = self._last_r2j
+                if last[0] is None or any(abs(joints[i] - last[i]) > 5.0 for i in range(4)):
+                    self._last_r2j = joints[:]
+                    self._csv.log(
+                        source="RECV", event_type="JOINTS", robot="R2",
+                        j1=round(joints[0], 2), j2=round(joints[1], 2),
+                        j3=round(joints[2], 2), j4=round(joints[3], 2),
+                    )
+
             elif topic == SUB_R1_IR:
-                self._msg_q.put(("r1_ir", data["state"]))
+                state = data["state"]
+                self._msg_q.put(("r1_ir", state))
+                if state != self._last_r1_ir:
+                    self._last_r1_ir = state
+                    j = self._last_r1j
+                    self._csv.log(
+                        source="RECV", event_type="IR_CHANGE", robot="R1",
+                        result="DETECT" if state else "CLEAR",
+                        j1="" if j[0] is None else round(j[0], 2),
+                        j2="" if j[1] is None else round(j[1], 2),
+                        j3="" if j[2] is None else round(j[2], 2),
+                        j4="" if j[3] is None else round(j[3], 2),
+                        note=f"IR={state}",
+                    )
+
             elif topic == SUB_R2_IR:
-                self._msg_q.put(("r2_ir", data["state"]))
+                state = data["state"]
+                self._msg_q.put(("r2_ir", state))
+                if state != self._last_r2_ir:
+                    self._last_r2_ir = state
+                    self._csv.log(
+                        source="RECV", event_type="IR_CHANGE", robot="R2",
+                        result="DETECT" if state else "CLEAR",
+                        note=f"IR={state}",
+                    )
+
             elif topic == SUB_SYS_STATUS:
-                self._msg_q.put(("sys_status", data["status"]))
+                status = data["status"]
+                self._msg_q.put(("sys_status", status))
+                if status != self._last_sys_status:
+                    self._last_sys_status = status
+                    self._csv.log(
+                        source="RECV", event_type="STATUS", robot="SYSTEM",
+                        action=status, result=status,
+                    )
+
             elif topic == SUB_2DOF_JOINTS:
-                self._msg_q.put(("2dof", data["j1"], data.get("state", "idle")))
+                angle = data["j1"]
+                state = data.get("state", "idle")
+                self._msg_q.put(("2dof", angle, state))
+                if state != self._last_2dof_state:
+                    self._last_2dof_state = state
+                    self._csv.log(
+                        source="RECV", event_type="2DOF", robot="2DOF",
+                        action=state, j1=round(angle, 2),
+                    )
+
+            elif topic in (TOPIC_R1, TOPIC_R2, TOPIC_BOTH):
+                if raw in self._sent_msgs:
+                    return  # echo of our own send — skip
+                robot  = "R1" if topic == TOPIC_R1 else ("R2" if topic == TOPIC_R2 else "ALL")
+                action = data.get("action", "")
+                self._csv.log(
+                    source="RECV_EXT", event_type="COMMAND", robot=robot,
+                    action=action,
+                    result=data.get("result", ""),
+                    x=data.get("x", ""), y=data.get("y", ""),
+                    z=data.get("z", ""), r=data.get("r", ""),
+                    note=data.get("status", ""),
+                )
+                ts = datetime.now().strftime("%H:%M:%S")
+                self._msg_q.put(("log",
+                                  f"[{ts}] 📡 EXT {robot}: {action} {data.get('result', '')}",
+                                  C_MUTED))
         except Exception:
             pass
 
@@ -669,10 +809,27 @@ class SimPublisherGUI(ctk.CTk):
             self._log("⚠  ยังไม่ได้ต่อ MQTT", color=C_WARN)
             return
         msg = json.dumps(payload)
+        self._sent_msgs.append(msg)   # track for echo dedup in _on_message
         self._mqtt.publish(topic, msg)
         ts = datetime.now().strftime("%H:%M:%S")
         short_topic = topic.split("/")[-2] + "/" + topic.split("/")[-1]
         self._log(f"[{ts}] ▶ {short_topic}  {msg}", color=C_BLUE)
+        # CSV: log outgoing command with last known joint positions
+        action = payload.get("action", "")
+        robot  = "R1" if topic == TOPIC_R1 else ("R2" if topic == TOPIC_R2 else "ALL")
+        j = self._last_r1j if robot == "R1" else (self._last_r2j if robot == "R2" else [None]*4)
+        self._csv.log(
+            source="SENT", event_type="COMMAND", robot=robot,
+            action=action,
+            result=payload.get("result", ""),
+            x=payload.get("x", ""), y=payload.get("y", ""),
+            z=payload.get("z", ""), r=payload.get("r", ""),
+            j1="" if j[0] is None else round(j[0], 2),
+            j2="" if j[1] is None else round(j[1], 2),
+            j3="" if j[2] is None else round(j[2], 2),
+            j4="" if j[3] is None else round(j[3], 2),
+            note=payload.get("status", ""),
+        )
 
     def _send_process(self, result: str):
         """Send process command; includes pick override when checkbox is ticked."""
