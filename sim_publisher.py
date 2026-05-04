@@ -10,6 +10,7 @@ Topics publish:
 Topics subscribe (feedback):
   factory/dobot1/joints   factory/dobot2/joints
   factory/dobot1/irsensor factory/dobot2/irsensor
+  factory/system/status
 """
 
 import json
@@ -31,10 +32,12 @@ TOPIC_R1   = "kmutt/cpe393/robot1/command"
 TOPIC_R2   = "kmutt/cpe393/robot2/command"
 TOPIC_BOTH = "kmutt/cpe393/all/command"
 
-SUB_R1_JOINTS = "factory/dobot1/joints"
-SUB_R2_JOINTS = "factory/dobot2/joints"
-SUB_R1_IR     = "factory/dobot1/irsensor"
-SUB_R2_IR     = "factory/dobot2/irsensor"
+SUB_R1_JOINTS  = "factory/dobot1/joints"
+SUB_R2_JOINTS  = "factory/dobot2/joints"
+SUB_R1_IR      = "factory/dobot1/irsensor"
+SUB_R2_IR      = "factory/dobot2/irsensor"
+SUB_SYS_STATUS = "factory/system/status"
+SUB_2DOF_JOINTS = "factory/2dof/joints"
 
 # =============================================================================
 # --- COLOUR PALETTE ---
@@ -78,6 +81,10 @@ class SimPublisherGUI(ctk.CTk):
         self._r2_joints = [0.0, 0.0, 0.0, 0.0]
         self._r1_ir = 0
         self._r2_ir = 0
+        self._sys_status = "unknown"
+        self._2dof_angle = 0.0
+        self._2dof_state = "idle"
+        self._test_running = False
 
         self._build_ui()
         self._mqtt_connect()
@@ -114,6 +121,7 @@ class SimPublisherGUI(ctk.CTk):
         body.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=1)
         body.rowconfigure(1, weight=0)
+        body.rowconfigure(2, weight=0)
 
         # Left column: R1 + R2 cards
         left = ctk.CTkFrame(body, fg_color=C_BG)
@@ -134,6 +142,9 @@ class SimPublisherGUI(ctk.CTk):
 
         self._build_feedback_card(right)
         self._build_log_card(right)
+
+        # Test card
+        self._build_test_card(body)
 
         # Bottom: E-STOP bar
         self._build_estop_bar(body)
@@ -173,14 +184,27 @@ class SimPublisherGUI(ctk.CTk):
             row0, text="✔  GOOD", width=130, height=36,
             fg_color=C_GOOD, hover_color="#27ae60", text_color="white",
             font=ctk.CTkFont(size=13, weight="bold"),
-            command=lambda: self._send(TOPIC_R1, {"action": "process", "result": "good"}),
+            command=lambda: self._send_process("good"),
         ).pack(side="left", padx=(4, 6))
         ctk.CTkButton(
             row0, text="✘  BAD", width=130, height=36,
             fg_color=C_BAD, hover_color="#c0392b", text_color="white",
             font=ctk.CTkFont(size=13, weight="bold"),
-            command=lambda: self._send(TOPIC_R1, {"action": "process", "result": "bad"}),
+            command=lambda: self._send_process("bad"),
         ).pack(side="left")
+
+        # Row 0b: custom pick override toggle
+        row0b = ctk.CTkFrame(parent, fg_color="transparent")
+        row0b.pack(fill="x", pady=(0, 2))
+        self._use_pick_override = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            row0b,
+            text="ใช้ตำแหน่ง pick จาก Move (x/y/z/r)",
+            variable=self._use_pick_override,
+            font=ctk.CTkFont(size=11),
+            text_color=C_MUTED,
+            checkbox_width=16, checkbox_height=16,
+        ).pack(side="left", padx=(74, 0))
 
         # Row 1: Pusher
         row1 = ctk.CTkFrame(parent, fg_color="transparent")
@@ -301,9 +325,27 @@ class SimPublisherGUI(ctk.CTk):
             lbl.grid(row=3, column=i, padx=2, pady=2, sticky="ew")
             self._r2j_lbl.append(lbl)
 
+        # 2DOF arm row
+        ctk.CTkLabel(grid, text="2DOF Arm",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=C_MUTED).grid(row=4, column=0, columnspan=4,
+                                               sticky="w", pady=(6, 0))
+        self._2dof_angle_lbl = ctk.CTkLabel(
+            grid, text="J1: —",
+            font=ctk.CTkFont(size=11), text_color=C_TEXT,
+            fg_color=C_ACCENT, corner_radius=6, width=100,
+        )
+        self._2dof_angle_lbl.grid(row=5, column=0, padx=2, pady=2, sticky="ew")
+        self._2dof_state_lbl = ctk.CTkLabel(
+            grid, text="  ● IDLE  ",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color=C_RAIL_OFF, corner_radius=6, text_color="white", width=90,
+        )
+        self._2dof_state_lbl.grid(row=5, column=1, padx=2, pady=2, sticky="ew")
+
         # IR sensor indicators
         ir_row = ctk.CTkFrame(card, fg_color="transparent")
-        ir_row.pack(fill="x", padx=12, pady=(0, 8))
+        ir_row.pack(fill="x", padx=12, pady=(0, 4))
 
         ctk.CTkLabel(ir_row, text="IR Sensor  Rail1:",
                      font=ctk.CTkFont(size=11), text_color=C_MUTED).pack(side="left")
@@ -320,6 +362,17 @@ class SimPublisherGUI(ctk.CTk):
                                       fg_color=C_RAIL_OFF, corner_radius=8,
                                       text_color="white")
         self._ir2_lbl.pack(side="left", padx=6)
+
+        # System status badge
+        sys_row = ctk.CTkFrame(card, fg_color="transparent")
+        sys_row.pack(fill="x", padx=12, pady=(0, 8))
+        ctk.CTkLabel(sys_row, text="System:",
+                     font=ctk.CTkFont(size=11), text_color=C_MUTED).pack(side="left")
+        self._sys_lbl = ctk.CTkLabel(sys_row, text="  — unknown  ",
+                                      font=ctk.CTkFont(size=11, weight="bold"),
+                                      fg_color=C_ACCENT, corner_radius=8,
+                                      text_color=C_TEXT)
+        self._sys_lbl.pack(side="left", padx=6)
 
     # ── Log card ──────────────────────────────────────────────────────────────
     def _build_log_card(self, parent):
@@ -349,28 +402,212 @@ class SimPublisherGUI(ctk.CTk):
     # ── E-Stop bar ────────────────────────────────────────────────────────────
     def _build_estop_bar(self, parent):
         bar = ctk.CTkFrame(parent, fg_color=C_CARD, corner_radius=10, height=58)
-        bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        bar.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         bar.pack_propagate(False)
 
         ctk.CTkButton(
             bar,
             text="⛔  EMERGENCY STOP",
-            width=260, height=44,
+            width=220, height=44,
             fg_color=C_STOP, hover_color=C_STOP_HV,
-            font=ctk.CTkFont(size=16, weight="bold"),
+            font=ctk.CTkFont(size=15, weight="bold"),
             text_color="white",
             corner_radius=8,
             command=self._emergency_stop,
-        ).pack(side="left", padx=16, pady=7)
+        ).pack(side="left", padx=(16, 6), pady=7)
+
+        ctk.CTkButton(
+            bar,
+            text="⏸  PAUSE",
+            width=110, height=44,
+            fg_color=C_WARN, hover_color="#d68910",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="white",
+            corner_radius=8,
+            command=self._pause,
+        ).pack(side="left", padx=4, pady=7)
+
+        ctk.CTkButton(
+            bar,
+            text="▶  RESUME",
+            width=120, height=44,
+            fg_color=C_GOOD, hover_color="#27ae60",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="white",
+            corner_radius=8,
+            command=self._resume,
+        ).pack(side="left", padx=4, pady=7)
 
         ctk.CTkLabel(
             bar,
-            text="ส่งคำสั่ง stop ไปที่  kmutt/cpe393/all/command\nหยุด simulation ทันที",
-            font=ctk.CTkFont(size=11),
+            text="kmutt/cpe393/all/command",
+            font=ctk.CTkFont(size=10),
             text_color=C_MUTED,
             justify="left",
         ).pack(side="left", padx=8)
+    # ── Test card ──────────────────────────────────────────────────────────────────────────
+    def _build_test_card(self, parent):
+        card = ctk.CTkFrame(parent, fg_color=C_CARD, corner_radius=12)
+        card.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 6))
 
+        hdr = ctk.CTkFrame(card, fg_color="#2c3e50", corner_radius=8, height=32)
+        hdr.pack(fill="x", padx=8, pady=(8, 4))
+        hdr.pack_propagate(False)
+        ctk.CTkLabel(hdr, text="  🧪  System Test",
+                     font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=C_TEXT).pack(side="left", padx=10, pady=5)
+        self._test_status_lbl = ctk.CTkLabel(
+            hdr, text="  Ready  ",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color=C_RAIL_OFF, corner_radius=6, text_color="white",
+        )
+        self._test_status_lbl.pack(side="right", padx=10, pady=5)
+
+        inner = ctk.CTkFrame(card, fg_color="transparent")
+        inner.pack(fill="x", padx=12, pady=(2, 8))
+
+        # ── Auto test row ───────────────────────────────────────────────────────────────────
+        rowA = ctk.CTkFrame(inner, fg_color="transparent")
+        rowA.pack(fill="x", pady=(0, 4))
+        ctk.CTkLabel(rowA, text="Auto:", font=ctk.CTkFont(size=11),
+                     text_color=C_MUTED, width=56).pack(side="left")
+        self._test_btn_good = ctk.CTkButton(
+            rowA, text="🧪  Test GOOD", width=130, height=32,
+            fg_color="#1a6b4a", hover_color="#1e8a5e",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._start_good_test,
+        )
+        self._test_btn_good.pack(side="left", padx=(4, 4))
+        ctk.CTkButton(
+            rowA, text="🧪  Test BAD", width=130, height=32,
+            fg_color="#6b2c2c", hover_color="#8b3a3a",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._run_bad_test,
+        ).pack(side="left", padx=(0, 16))
+        ctk.CTkLabel(rowA, text="R1 wait:", font=ctk.CTkFont(size=11),
+                     text_color=C_MUTED).pack(side="left")
+        self._test_r1_delay = ctk.CTkEntry(rowA, width=44, height=26,
+                                            font=ctk.CTkFont(size=11))
+        self._test_r1_delay.insert(0, "12")
+        self._test_r1_delay.pack(side="left", padx=(3, 2))
+        ctk.CTkLabel(rowA, text="s   IR→clear wait:",
+                     font=ctk.CTkFont(size=11), text_color=C_MUTED).pack(side="left", padx=(2, 0))
+        self._test_ir_delay = ctk.CTkEntry(rowA, width=44, height=26,
+                                            font=ctk.CTkFont(size=11))
+        self._test_ir_delay.insert(0, "8")
+        self._test_ir_delay.pack(side="left", padx=(3, 2))
+        ctk.CTkLabel(rowA, text="s", font=ctk.CTkFont(size=11),
+                     text_color=C_MUTED).pack(side="left")
+
+        # ── Manual sim row ─────────────────────────────────────────────────────────────
+        rowB = ctk.CTkFrame(inner, fg_color="transparent")
+        rowB.pack(fill="x", pady=0)
+        ctk.CTkLabel(rowB, text="Manual:", font=ctk.CTkFont(size=11),
+                     text_color=C_MUTED, width=56).pack(side="left")
+        ctk.CTkButton(
+            rowB, text="Sim IR = 1", width=100, height=28,
+            fg_color=C_WARN, hover_color="#d68910",
+            font=ctk.CTkFont(size=11),
+            command=lambda: self._sim_ir(1),
+        ).pack(side="left", padx=(4, 4))
+        ctk.CTkButton(
+            rowB, text="Sim IR = 0", width=100, height=28,
+            fg_color=C_ACCENT, hover_color="#1a5276",
+            font=ctk.CTkFont(size=11),
+            command=lambda: self._sim_ir(0),
+        ).pack(side="left", padx=(0, 12))
+        ctk.CTkButton(
+            rowB, text="Trigger Robot2", width=130, height=28,
+            fg_color=C_BLUE, hover_color="#2980b9",
+            font=ctk.CTkFont(size=11),
+            command=self._trigger_robot2,
+        ).pack(side="left", padx=(0, 4))
+
+    # ═════════════════════════════════════════ Test helpers ═══════════════════════════
+
+    def _sim_ir(self, state: int):
+        """Publish simulated IR state to factory/dobot1/irsensor (manual step)."""
+        if not self._connected:
+            self._log("⚠  ยังไม่ได้ต่อ MQTT", color=C_WARN)
+            return
+        self._mqtt.publish(SUB_R1_IR, json.dumps({"state": state}))
+        ts = datetime.now().strftime("%H:%M:%S")
+        icon = "🔴" if state else "⚪"
+        self._log(f"[{ts}] {icon} Sim IR={state} → {SUB_R1_IR}",
+                  color=C_WARN if state else C_MUTED)
+
+    def _trigger_robot2(self):
+        """Send trigger action directly to Robot2 autonomous loop."""
+        self._send(TOPIC_R2, {"action": "trigger"})
+
+    def _start_good_test(self):
+        """Button handler: launch full GOOD test in a background thread."""
+        if not self._connected:
+            self._log("⚠  ยังไม่ได้ต่อ MQTT", color=C_WARN)
+            return
+        if self._test_running:
+            self._log("⚠  Test อยู่ระหว่างทำงาน กรุณารอ", color=C_WARN)
+            return
+        threading.Thread(target=self._run_good_test, daemon=True).start()
+
+    def _run_good_test(self):
+        """
+        Full automated GOOD test (background thread):
+          1. Publish process/good  → Robot1 picks + places on Rail1 belt
+          2. After r1_delay s     → publish IR=1 (product at Rail1 end)
+             sim rail1_loop stops belt, runs 2DOF, sends pick to Robot2
+          3. After ir_delay s     → publish IR=0 (Robot2 has taken product)
+             rail1_loop decrements count; Robot2 places on Rail2 autonomously
+        """
+        self._test_running = True
+        self._msg_q.put(("test_status", "RUNNING", C_WARN))
+        try:
+            r1_delay = float(self._test_r1_delay.get() or 12)
+            ir_delay = float(self._test_ir_delay.get() or 8)
+
+            self._msg_q.put(("log", "🧪 [Test] เริ่ม GOOD test sequence...", C_BLUE))
+
+            # 1 — Robot1 GOOD sequence
+            self._mqtt.publish(TOPIC_R1,
+                               json.dumps({"action": "process", "result": "good"}))
+            self._msg_q.put(("log",
+                              f"🧪 [Test] Robot1 GOOD sent — รอ {r1_delay:.0f}s ให้ Robot1 เสร็จ...",
+                              C_BLUE))
+            time.sleep(r1_delay)
+
+            # 2 — Simulate IR=1: product arrived at Rail1 end
+            self._mqtt.publish(SUB_R1_IR, json.dumps({"state": 1}))
+            self._msg_q.put(("log",
+                              "🧪 [Test] Sim IR=1 → สินค้าถึงปลายสายพาน Rail1",
+                              C_WARN))
+            self._msg_q.put(("log",
+                              f"🧪 [Test] รอ {ir_delay:.0f}s ให้ 2DOF sweep + Robot2 หยิบ...",
+                              C_BLUE))
+            time.sleep(ir_delay)
+
+            # 3 — Simulate IR=0: Robot2 has picked the product
+            self._mqtt.publish(SUB_R1_IR, json.dumps({"state": 0}))
+            self._msg_q.put(("log",
+                              "🧪 [Test] Sim IR=0 → Robot2 หยิบสินค้าออกแล้ว",
+                              C_GOOD))
+            self._msg_q.put(("log",
+                              "🧪 [Test] GOOD test เสร็จสมบูรณ์ ✓  (Robot2 กำลังวางบน Rail2)",
+                              C_GOOD))
+            self._msg_q.put(("test_status", "Done ✓", C_GOOD))
+
+        except Exception as e:
+            self._msg_q.put(("log", f"🧪 [Test] Error: {e}", C_BAD))
+            self._msg_q.put(("test_status", "Error", C_BAD))
+        finally:
+            self._test_running = False
+
+    def _run_bad_test(self):
+        """Send BAD process to Robot1 — reject sequence (no IR simulation needed)."""
+        if not self._connected:
+            self._log("⚠  ยังไม่ได้ต่อ MQTT", color=C_WARN)
+            return
+        self._send(TOPIC_R1, {"action": "process", "result": "bad"})
+        self._log("🧪 [Test] BAD test — Robot1 reject sequence", color=C_BAD)
     # ═════════════════════════════════════ MQTT ══════════════════════════════
 
     def _mqtt_connect(self):
@@ -394,6 +631,8 @@ class SimPublisherGUI(ctk.CTk):
             client.subscribe(SUB_R2_JOINTS)
             client.subscribe(SUB_R1_IR)
             client.subscribe(SUB_R2_IR)
+            client.subscribe(SUB_SYS_STATUS)
+            client.subscribe(SUB_2DOF_JOINTS)
             self._msg_q.put(("connected", True))
             self._msg_q.put(("log", f"Connected to {MQTT_BROKER}", C_GOOD))
         else:
@@ -418,6 +657,10 @@ class SimPublisherGUI(ctk.CTk):
                 self._msg_q.put(("r1_ir", data["state"]))
             elif topic == SUB_R2_IR:
                 self._msg_q.put(("r2_ir", data["state"]))
+            elif topic == SUB_SYS_STATUS:
+                self._msg_q.put(("sys_status", data["status"]))
+            elif topic == SUB_2DOF_JOINTS:
+                self._msg_q.put(("2dof", data["j1"], data.get("state", "idle")))
         except Exception:
             pass
 
@@ -431,9 +674,32 @@ class SimPublisherGUI(ctk.CTk):
         short_topic = topic.split("/")[-2] + "/" + topic.split("/")[-1]
         self._log(f"[{ts}] ▶ {short_topic}  {msg}", color=C_BLUE)
 
+    def _send_process(self, result: str):
+        """Send process command; includes pick override when checkbox is ticked."""
+        payload: dict = {"action": "process", "result": result}
+        if self._use_pick_override.get():
+            try:
+                entries = self._r1_xyz
+                payload["x"] = float(entries["x"].get() or 0)
+                payload["y"] = float(entries["y"].get() or 0)
+                payload["z"] = float(entries["z"].get() or 0)
+                payload["r"] = float(entries["r"].get() or 0)
+            except ValueError:
+                self._log("⚠  ค่า x/y/z/r ต้องเป็นตัวเลข (pick override)", color=C_WARN)
+                return
+        self._send(TOPIC_R1, payload)
+
     def _emergency_stop(self):
         self._send(TOPIC_BOTH, {"action": "stop"})
         self._log("⛔  EMERGENCY STOP sent!", color=C_BAD)
+
+    def _pause(self):
+        self._send(TOPIC_BOTH, {"action": "pause"})
+        self._log("⏸  PAUSE sent", color=C_WARN)
+
+    def _resume(self):
+        self._send(TOPIC_BOTH, {"action": "resume"})
+        self._log("▶  RESUME sent", color=C_GOOD)
 
     # ═════════════════════════════════════ Queue drain ═══════════════════════
 
@@ -471,6 +737,27 @@ class SimPublisherGUI(ctk.CTk):
                     else:
                         self._ir2_lbl.configure(text="  ○ CLEAR  ",
                                                  fg_color=C_RAIL_OFF)
+                elif kind == "sys_status":
+                    s = item[1]
+                    color_map = {
+                        "running": C_GOOD,
+                        "paused":  C_WARN,
+                        "stopped": C_BAD,
+                    }
+                    fg = color_map.get(s, C_ACCENT)
+                    self._sys_lbl.configure(text=f"  {s.upper()}  ", fg_color=fg)
+                elif kind == "2dof":
+                    angle = item[1]
+                    state = item[2]
+                    self._2dof_angle_lbl.configure(text=f"J1: {angle:.1f}°")
+                    if state == "moving":
+                        self._2dof_state_lbl.configure(text="  ● MOVING  ", fg_color=C_BLUE)
+                    else:
+                        self._2dof_state_lbl.configure(text="  ● IDLE  ", fg_color=C_RAIL_OFF)
+                elif kind == "test_status":
+                    self._test_status_lbl.configure(
+                        text=f"  {item[1]}  ", fg_color=item[2]
+                    )
         except queue.Empty:
             pass
         self.after(150, self._drain_queue)
